@@ -1,6 +1,6 @@
 {
   "include": ["."],
   "extraPaths": [
-    "/Applications/IDA Professional 9.0.app/Contents/MacOS/python/3"
+    "/Applications/IDA Professional 9.0.app/Contents/MacOS/python/"
   ]
 }
