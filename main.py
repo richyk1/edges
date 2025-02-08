@@ -1,3 +1,4 @@
+import datetime
 import json
 import os
 from typing import Any, Dict, Set, cast
@@ -7,10 +8,35 @@ import idautils
 import idc
 import networkx as nx
 
-# Build the save path using os.path.join for OS independence.
-SAVE_PATH = os.path.join(os.path.expanduser("~"), "Github", "edges/cgn")
+DATE = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
+SAVE_PATH = os.path.join(
+    os.path.expanduser("~"), "Github", "edges", "cgn_" + DATE
+)
 os.makedirs(SAVE_PATH, exist_ok=True)
-MAX_FUNCTIONS = 100  # Process up to 100 functions
+
+
+def demangle_function_name(name: str) -> str:
+    """
+    Demangles a function name using idaapi.demangle_name.
+
+    This function uses the disable mask obtained via get_inf_attr(INF_SHORT_DN)
+    to control the demangling process.
+
+    Args:
+        name (str): The mangled function name.
+
+    Returns:
+        str: The demangled function name if demangling is successful,
+             otherwise the original name.
+    """
+    # Get the demangling mask from the IDA information.
+    disable_mask = idc.get_inf_attr(idc.INF_SHORT_DN)
+
+    # Attempt to demangle the name using the retrieved mask.
+    demangled = idaapi.demangle_name(name, disable_mask)
+
+    # If demangling fails, return the original name.
+    return demangled if demangled is not None else name
 
 
 def get_instruction_count_bb(func_addr: int) -> int:
@@ -45,12 +71,16 @@ def get_total_edges(func_addr: int) -> int:
 
 def get_num_local_vars(func_addr: int) -> int:
     """Returns the number of local variables in a function."""
-    frame_id = idc.get_frame_id(func_addr)
-    count = 0
-    for member in idautils.StructMembers(frame_id):
-        if "var" in member[1]:
-            count += 1
-    return count
+    try:
+        frame_id = idc.get_frame_id(func_addr)
+        count = 0
+        for member in idautils.StructMembers(frame_id):
+            if "var" in member[1]:
+                count += 1
+        return count
+    except Exception as e:
+        print(f"Error getting local variables for 0x{func_addr:x}: {e}")
+        return 0
 
 
 def get_function_arguments(func_addr: int) -> int:
@@ -77,7 +107,7 @@ def build_call_graph() -> nx.DiGraph:
     G = nx.DiGraph()
     for func_addr in idautils.Functions():
         func_name = idaapi.get_func_name(func_addr)
-        G.add_node(func_addr, name=func_name)
+        G.add_node(func_addr, name=demangle_function_name(func_name))
         callees = set(idautils.CodeRefsFrom(func_addr, 0))
         callers = set(idautils.CodeRefsTo(func_addr, 0))
         for callee in callees:
@@ -107,6 +137,12 @@ def compute_edge_weights(G: nx.DiGraph, func_addr: int) -> Dict[Any, float]:
     for callee in callees:
         callees_of_callees |= set(idautils.CodeRefsFrom(callee, 0))
     neighbors: Set[int] = callers | callees | callees_of_callees | {func_addr}
+
+    # Arbitrary limit to massive call graphlets such as
+    # void __cdecl __noreturn __clang_call_terminate(void *)
+    if len(neighbors) > 1000:
+        raise ValueError("Call graphlet too large.")
+
     subgraph = G.subgraph(neighbors)
     return nx.edge_betweenness_centrality(subgraph)
 
@@ -120,51 +156,22 @@ def export_function_json(
 ) -> None:
     """
     For a given target function (func_addr), build the JSON representation
-    of its call graphlet with the following structure:
-
-    {
-      "adjacency": [...],
-      "directed": "True",
-      "graph": [],
-      "multigraph": false,
-      "nodes": [
-          {
-            "id": 0,
-            "funcName": "...",
-            "functionFeatureSubset": {
-                "name": "...",
-                "ninstrs": ...,
-                "edges": ...,
-                "indegree": ...,
-                "outdegree": ...,
-                "nlocals": ...,
-                "nargs": ...,
-                "signature": ""
-            }
-          },
-          ...
-      ]
-    }
-
-    Each node corresponds to a function in the call graphlet.
-    The "adjacency" is a list of lists, where each inner list contains dictionaries
-    for outgoing edges from that node, with keys "id" and "weight".
+    of its call graphlet and save it as a JSON file.
     """
-    # First, assign each node in the subgraph a new integer id.
+    # Assign each node in the subgraph a new integer id.
     nodes_list = list(G.nodes())
     node_id_map = {addr: idx for idx, addr in enumerate(nodes_list)}
 
-    # For every node, compute its features.
+    # Compute features for every node.
     nodes_json = []
     for addr in nodes_list:
-        func_name = idaapi.get_func_name(addr)
+        func_name = demangle_function_name(idc.get_func_name(addr))
         ninstrs = get_instruction_count_bb(addr)
         total_edges = get_total_edges(addr)
         indegree = get_indegree(addr)
         outdegree = get_outdegree(addr)
         nlocals = get_num_local_vars(addr)
         nargs = get_function_arguments(addr)
-        # For signature, use empty string (or update as needed)
         signature = ""
         node_json = {
             "id": node_id_map[addr],
@@ -183,17 +190,13 @@ def export_function_json(
         nodes_json.append(node_json)
 
     # Build the adjacency list.
-    # Initialize an empty list for each node.
     adjacency = [[] for _ in range(len(nodes_list))]
     for u, v, data in G.edges(data=True):
-        # Use the new integer ids.
         u_id = node_id_map[u]
         v_id = node_id_map[v]
-        # Edge weight: if not found in our computed dict, use 0.
         weight = data.get("weight", 0.0)
         adjacency[u_id].append({"id": v_id, "weight": weight})
 
-    # Build the final JSON structure.
     json_obj = {
         "adjacency": adjacency,
         "directed": "True",
@@ -202,11 +205,8 @@ def export_function_json(
         "nodes": nodes_json,
     }
 
-    # Save the JSON file.
-    target_name = idaapi.get_func_name(func_addr)
-    out_filename = os.path.join(
-        output_dir, f"{file_index:04d}-{target_name}.json"
-    )
+    target_name = demangle_function_name(idc.get_func_name(func_addr))
+    out_filename = os.path.join(output_dir, f"{file_index}_{target_name}.json")
     with open(out_filename, "w") as f:
         json.dump(json_obj, f, indent=None)
     print(f"Saved JSON for function {target_name} to {out_filename}")
@@ -216,18 +216,22 @@ def main() -> None:
     """
     Main processing function:
       - Builds the global call graph.
-      - For each function (up to MAX_FUNCTIONS), extracts its call graphlet,
-        computes edge weights, and exports the graph as a JSON file.
+      - After each BATCH_SIZE functions.
+      - Exports each function's call graphlet as JSON.
     """
+    print(f"Saving JSON files to: {SAVE_PATH}")
     call_graph = build_call_graph()
-    functions = idautils.Functions()
-    processed = 0
-    file_index = 0
 
-    while processed < MAX_FUNCTIONS:
+    functions = idautils.Functions()
+    file_index = 0
+    while True:
         func_addr = next(functions, None)
         if func_addr is None:
             break
+
+        func_name = idc.get_func_name(func_addr)
+        print(f"Processing function at 0x{func_addr:x} ({func_name})")
+
         try:
             edge_weights = compute_edge_weights(call_graph, func_addr)
             # Extract the call graphlet (neighbors) for the function.
@@ -242,19 +246,18 @@ def main() -> None:
             subgraph = nx.DiGraph(call_graph.subgraph(neighbors).copy())
             # Set the computed edge weights as attributes.
             for u, v in subgraph.edges():
-                # Cast the edge attributes to a plain dict so we can update them.
                 attr: dict[str, Any] = cast(dict, subgraph[u][v])
                 attr["weight"] = edge_weights.get((u, v), 0.0)
 
-            # Export the subgraph as JSON.
             export_function_json(
                 func_addr, subgraph, edge_weights, SAVE_PATH, file_index
             )
             file_index += 1
-            processed += 1
         except Exception as e:
             print(f"Error processing function at 0x{func_addr:x}: {e}")
             continue
+
+    print("Processing complete.")
 
 
 if __name__ == "__main__":
