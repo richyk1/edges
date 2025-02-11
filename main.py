@@ -1,28 +1,36 @@
-import datetime
+from headless_ida import HeadlessIda
+
+# Initialize HeadlessIda.
+headlessida = HeadlessIda(
+    "/Applications/IDA Professional 9.0.app/Contents/MacOS/idat",
+    "/Users/kerosene/Desktop/eu4_1.27.2.i64",
+)
+
+# Import IDA modules.
+import idautils
+import idaapi
 import json
 import logging
 import os
-from typing import Any, Dict, Set, Tuple, cast
+from typing import Dict, Set, Tuple
 
 import idaapi
-import idautils
 import idc
 import rustworkx as rx
-import itertools
+import argparse
+from tqdm import tqdm
+import datetime
+from collections import deque
+
 
 logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.DEBUG)
 
-
-logging.basicConfig(filename="", level=logging.INFO)
-logger.info("Started")
 # Set up an output directory.
-DATE = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
-
-# TODO: Change the SAVE_PATH to your desired output directory.
-VERSION = "1.35.2_test"
 SAVE_PATH = os.path.join(os.path.expanduser("~"), "Github", "edges")
 os.makedirs(SAVE_PATH, exist_ok=True)
 
+# Cache for demangled function names.
 _demangle_cache: Dict[str, str] = {}
 
 
@@ -36,54 +44,47 @@ def demangle_function_name(name: str) -> str:
     return result
 
 
-global_callers: Dict[int, Set[int]] = {}
-global_callees: Dict[int, Set[int]] = {}
+def get_callers(func_addr: int) -> Set[int]:
+    return {
+        idc.get_func_attr(xref.frm, idc.FUNCATTR_START)
+        for xref in idautils.XrefsTo(func_addr, idaapi.XREF_USER)
+        # Include only CALL xrefs (fl_CN, fl_CF) and JMP xrefs (fl_JN, fl_JF)
+        if xref.type in (idaapi.fl_CN, idaapi.fl_CF, idaapi.fl_JN, idaapi.fl_JF)
+        and idc.get_func_attr(xref.frm, idc.FUNCATTR_START) != idc.BADADDR
+    }
 
-ida_funcs = itertools.tee(idautils.Functions(), 4)
 
+def get_callees(func_addr: int) -> Set[int]:
+    callees = set()
 
-def precompute_references() -> None:
-    for func_addr in ida_funcs[0]:
-        # For callers: XrefsTo returns xref objects.
-        # Use getattr to safely get the 'frm' attribute and ensure it's an int.
-        global_callers[func_addr] = {
-            frm
-            for xref in idautils.XrefsTo(func_addr, 0)
-            if (frm := getattr(xref, "frm", None)) is not None and isinstance(frm, int)
-        }
-        # For callees: XrefsFrom returns xref objects.
-        # Use getattr to safely get the 'to' attribute and ensure it's an int.
-        global_callees[func_addr] = {
-            to
-            for xref in idautils.XrefsFrom(func_addr, 0)
-            if (to := getattr(xref, "to", None)) is not None and isinstance(to, int)
-        }
+    # Get the function object from its start address
+    func = idaapi.get_func(func_addr)
+    if not func:
+        logger.error(f"[-] Function at {hex(func_addr)} not found.")
+        return callees
+
+    # Iterate over all instructions in the function
+    for insn_addr in idautils.FuncItems(func_addr):
+        if idc.print_insn_mnem(insn_addr) == "call":
+            # Get the target of the call instruction
+            call_target = idc.get_operand_value(insn_addr, 0)
+
+            # Verify it's a function start
+            func_start = idc.get_func_attr(call_target, idc.FUNCATTR_START)
+            if func_start != idc.BADADDR:
+                callees.add(func_start)
+
+    return callees
 
 
 def get_instruction_count_bb(func_addr: int) -> int:
     func = idaapi.get_func(func_addr)
-    if not func:
-        return 0
-    count = 0
-    for bb in idaapi.FlowChart(func):
-        count += sum(
-            1
-            for head in idautils.Heads(bb.start_ea, bb.end_ea)
-            if idc.is_code(idc.get_full_flags(head))
-        )
+    count = sum(
+        1
+        for head in idautils.Heads(func.start_ea, func.end_ea)
+        if idc.is_code(idc.get_full_flags(head))
+    )
     return count
-
-
-def get_indegree(func_addr: int) -> int:
-    return len(global_callers.get(func_addr, set()))
-
-
-def get_outdegree(func_addr: int) -> int:
-    return len(global_callees.get(func_addr, set()))
-
-
-def get_total_edges(func_addr: int) -> int:
-    return get_indegree(func_addr) + get_outdegree(func_addr)
 
 
 def get_num_local_vars(func_addr: int) -> int:
@@ -95,7 +96,7 @@ def get_num_local_vars(func_addr: int) -> int:
                 count += 1
         return count
     except Exception as e:
-        print(f"Error getting local variables for 0x{func_addr:x}: {e}")
+        logger.error(f"[-] Error getting local variables for 0x{func_addr:x}: {e}")
         return 0
 
 
@@ -104,7 +105,6 @@ def get_function_arguments(func_addr: int) -> int:
     funcdata = idaapi.func_type_data_t()
     if idaapi.get_tinfo(tif, func_addr) and tif.get_func_details(funcdata):
         return len(funcdata)
-
     try:
         frame_id = idc.get_frame_id(func_addr)
         count = 0
@@ -113,177 +113,341 @@ def get_function_arguments(func_addr: int) -> int:
                 count += 1
         return count
     except Exception as e:
-        print(f"Error getting arguments for 0x{func_addr:x}: {e}")
+        logger.error(f"[-] Error getting arguments for 0x{func_addr:x}: {e}")
         return 0
 
 
-def build_call_graph() -> Tuple[rx.PyDiGraph, Dict[int, int]]:
-    G = rx.PyDiGraph()
-    func_to_node: Dict[int, int] = {}
-    # First pass: add nodes.
-    for func_addr in ida_funcs[1]:
-        func_name = idc.get_func_name(func_addr)
-        node_payload = {
-            "name": func_name,
-            "ninstrs": get_instruction_count_bb(func_addr),
-            "indegree": get_indegree(func_addr),
-            "outdegree": get_outdegree(func_addr),
-            "nlocals": get_num_local_vars(func_addr),
-            "nargs": get_function_arguments(func_addr),
-            "signature": demangle_function_name(func_name),
-        }
-        node_index = G.add_node(node_payload)
-        func_to_node[func_addr] = node_index
-    # Second pass: add edges.
-    for func_addr in ida_funcs[2]:
-        if func_addr not in func_to_node:
+def build_global_call_graph(max_funcs: int = None) -> rx.PyDiGraph:
+    """
+    Build and return a directed PyDiGraph (global call graph)
+    for all recognized functions in the IDB.
+    """
+    G = rx.PyDiGraph(multigraph=False)
+    func_to_node = {}
+
+    all_funcs = list(idautils.Functions())
+
+    if max_funcs:
+        all_funcs = all_funcs[:max_funcs]
+
+    total_funcs = len(all_funcs)
+    logger.debug(f"Discovered {total_funcs} total functions. Building graph...")
+
+    # (A) Create nodes with tqdm
+    for func_addr in tqdm(all_funcs, desc="Creating nodes", mininterval=5.0):
+        if get_instruction_count_bb(func_addr) < 5:
             continue
-        u = func_to_node[func_addr]
-        # Use precomputed callees and callers.
-        for callee in global_callees.get(func_addr, set()):
-            if callee in func_to_node:
-                v = func_to_node[callee]
-                G.add_edge(u, v, None)  # Edge payload initially None.
-        for caller in global_callers.get(func_addr, set()):
-            if caller in func_to_node:
-                v = func_to_node[caller]
-                G.add_edge(v, u, None)
-        # Add second-degree edges: for each direct callee, add its callees.
-        for callee in global_callees.get(func_addr, set()):
-            if callee not in func_to_node:
-                continue
-            u_callee = func_to_node[callee]
-            for sdc in global_callees.get(callee, set()):
-                if sdc in func_to_node:
-                    v = func_to_node[sdc]
-                    G.add_edge(u_callee, v, None)
-    return G, func_to_node
 
-
-def get_call_graphlet_neighbors(func_addr: int) -> Set[int]:
-    callers = global_callers.get(func_addr, set())
-    callees = global_callees.get(func_addr, set())
-    callees_of_callees = set()
-    for callee in callees:
-        callees_of_callees |= global_callees.get(callee, set())
-    return callers | callees | callees_of_callees | {func_addr}
-
-
-def compute_edge_weights(
-    G: rx.PyDiGraph, func_addr: int, func_to_node: Dict[int, int]
-) -> Dict[Any, float]:
-    neighbors = get_call_graphlet_neighbors(func_addr)
-    if len(neighbors) > 1000:
-        raise ValueError("Call graphlet too large.")
-    # Convert function addresses to rustworkx node indices as a list.
-    neighbor_nodes = [func_to_node[addr] for addr in neighbors if addr in func_to_node]
-    subgraph = G.subgraph(neighbor_nodes)
-    # Compute edge betweenness centrality.
-    edge_centrality = rx.edge_betweenness_centrality(subgraph, normalized=True)
-    return dict(edge_centrality)
-
-
-def export_function_json(
-    func_addr: int,
-    subgraph: rx.PyDiGraph,
-    edge_weights: Dict[Any, float],
-    func_to_node: Dict[int, int],
-    output_dir: str,
-    file_index: int,
-) -> None:
-    node_indices = list(subgraph.node_indices())
-    # Create a new mapping from the subgraph's node indices to new IDs (0, 1, 2, …).
-    node_id_map = {node: idx for idx, node in enumerate(node_indices)}
-    nodes_json = []
-    for node in node_indices:
-        payload = subgraph[node]
-        node_json = {
-            "id": node_id_map[node],
-            "funcName": payload.get("name", ""),
-            "functionFeatureSubset": {
-                "name": payload.get("name", ""),
-                "ninstrs": payload.get("ninstrs", 0),
-                "edges": payload.get("indegree", 0) + payload.get("outdegree", 0),
-                "indegree": payload.get("indegree", 0),
-                "outdegree": payload.get("outdegree", 0),
-                "nlocals": payload.get("nlocals", 0),
-                "nargs": payload.get("nargs", 0),
-                "signature": payload.get("signature", ""),
-            },
-        }
-        nodes_json.append(node_json)
-    # Build the adjacency list from the edge list.
-    # Force a list conversion so that Pyright sees an iterable.
-    adjacency = [[] for _ in range(len(node_indices))]
-    for edge in list(subgraph.edge_list()):
-        # Cast the edge to a tuple so that we can safely unpack it.
-        edge_tuple = cast(Tuple[Any, ...], edge)
-        if len(edge_tuple) == 2:
-            u, v = edge_tuple
-        elif len(edge_tuple) == 3:
-            u, v, _ = edge_tuple
-        else:
-            continue  # Skip if edge_tuple has an unexpected length.
-        u_id = node_id_map[u]
-        v_id = node_id_map[v]
-        weight = edge_weights.get((u, v), 0.0) if edge_weights else 0.0
-        adjacency[u_id].append({"id": v_id, "weight": weight})
-    json_obj = {
-        "adjacency": adjacency,
-        "directed": "True",
-        "graph": [],
-        "multigraph": False,
-        "nodes": nodes_json,
-    }
-    target_name = idc.get_func_name(func_addr)
-    out_filename = os.path.join(output_dir, f"{target_name}.json")
-    with open(out_filename, "w") as f:
-        json.dump(json_obj, f, indent=None)
-    print(f"Saved JSON for function {target_name} to {out_filename}")
-
-
-def main() -> None:
-    print(f"Saving JSON files to: {SAVE_PATH}")
-    precompute_references()
-    call_graph, func_to_node = build_call_graph()
-    functions = ida_funcs[3]
-    functions = iter(["0x10185091A"])
-    file_index = 0
-    while True:
-        func_addr = next(functions, None)
-        if func_addr is None:
-            break
-
-        func_name = idc.get_func_name(func_addr)
-        logger.debug(f"Processing function at 0x{func_addr:x} ({func_name})")
         try:
-            edge_weights = compute_edge_weights(call_graph, func_addr, func_to_node)
-            logger.debug(f"Computed edge weights for 0x{func_addr:x}")
-            logger.debug(f"Edge weights: {edge_weights}")
-
-            neighbors = get_call_graphlet_neighbors(func_addr)
-            # Convert function addresses to rustworkx node indices as a list.
-            neighbor_nodes = [
-                func_to_node[addr] for addr in neighbors if addr in func_to_node
-            ]
-            subgraph = call_graph.subgraph(neighbor_nodes)
-            # In rustworkx, edge weights are not stored in edge payloads,
-            # so we assume our computed edge_weights (a dict mapping (u,v) to weight)
-            # can be used later during JSON export.
-            export_function_json(
-                func_addr,
-                subgraph,
-                edge_weights,
-                func_to_node,
-                SAVE_PATH,
-                file_index,
-            )
-            file_index += 1
+            node_payload = {
+                "addr": func_addr,
+                "name": idc.get_func_name(func_addr),
+                "ninstrs": get_instruction_count_bb(func_addr),
+                # indegree and outdegree can be computed from the graph
+                "nlocals": get_num_local_vars(func_addr),
+                "nargs": get_function_arguments(func_addr),
+                # signature unnecessary for now
+            }
+            node_index = G.add_node(node_payload)
+            func_to_node[func_addr] = node_index
         except Exception as e:
-            print(f"Error processing function at 0x{func_addr:x}: {e}")
+            logger.error(f"Error processing function 0x{func_addr:x}: {e}")
+
+    logger.debug("Finished creating nodes. Now building edges...")
+
+    # (B) Add edges with tqdm
+    func_items = list(func_to_node.items())  # so we can iterate in tqdm
+    for func_addr, u in tqdm(func_items, desc="Linking edges", mininterval=5.0):
+        for callee_addr in get_callees(func_addr):
+            if callee_addr in func_to_node:
+                v = func_to_node[callee_addr]
+                G.add_edge(u, v, None)
+
+    logger.debug("Finished building global call graph.")
+    return G
+
+
+def export_call_graph_to_json(G: rx.PyDiGraph, filepath: str) -> None:
+    """
+    Export the global call graph G to a JSON file.
+    Each node is stored with its index and payload.
+    Edges are stored as a list of {source, target}.
+    """
+    nodes_data = []
+    for idx, payload in enumerate(G.nodes()):
+        node_info = {
+            "index": idx,
+            "addr": payload["addr"],
+            "name": payload["name"],
+            "ninstrs": payload["ninstrs"],
+            "nlocals": payload["nlocals"],
+            "nargs": payload["nargs"],
+        }
+        nodes_data.append(node_info)
+
+    edges_data = []
+    for u, v in G.edge_list():
+        edges_data.append({"source": u, "target": v})
+
+    graph_data = {"nodes": nodes_data, "edges": edges_data}
+
+    with open(filepath, "w") as f:
+        json.dump(graph_data, f, indent=None)
+
+
+def import_call_graph_from_json(filepath: str) -> rx.PyDiGraph:
+    """
+    Reconstruct a PyDiGraph from the JSON that was exported.
+    Returns the reconstructed PyDiGraph.
+    """
+    with open(filepath, "r") as f:
+        graph_data = json.load(f)
+
+    G = rx.PyDiGraph(multigraph=False)
+
+    # We'll map "old index" from the JSON to "new index" in G
+    old_index_to_new = {}
+
+    # 1) Re-create nodes
+    for node_info in graph_data["nodes"]:
+        payload = {
+            "addr": node_info["addr"],
+            "name": node_info["name"],
+            "ninstrs": node_info["ninstrs"],
+            "nlocals": node_info["nlocals"],
+            "nargs": node_info["nargs"],
+        }
+        new_idx = G.add_node(payload)
+        old_index_to_new[node_info["index"]] = new_idx
+
+    # 2) Re-create edges
+    for edge_info in graph_data["edges"]:
+        u_old = edge_info["source"]
+        v_old = edge_info["target"]
+        # Map old node indices to new node indices in this fresh graph
+        u_new = old_index_to_new[u_old]
+        v_new = old_index_to_new[v_old]
+        G.add_edge(u_new, v_new, None)
+
+    return G
+
+
+def extract_call_graphlet(
+    G: rx.PyDiGraph, func_idx: int, max_depth: int = 2
+) -> rx.PyDiGraph:
+    """
+    Return a subgraph of `G` containing `func_addr` and
+    up to `max_depth` levels of its neighbors in the call graph.
+    Edges remain directed caller → callee as in `G`.
+    """
+
+    # 1) Get the node index for func_addr in G.
+    #    We'll do a small BFS/DFS outward from this node.
+    #    Also consider a BFS *backwards* to get callers if you prefer.
+    node_indices = []
+    visited = set()
+
+    queue = deque()
+    start_index = func_idx
+
+    # Enqueue the start node with depth = 0
+    queue.append((start_index, 0))
+    visited.add(start_index)
+
+    while queue:
+        current_idx, depth = queue.popleft()
+        node_indices.append(current_idx)
+
+        if depth < max_depth:
+            # Outgoing edges (caller → callee)
+            for _, neighbor_idx, _ in G.out_edges(current_idx):
+                if neighbor_idx not in visited:
+                    visited.add(neighbor_idx)
+                    queue.append((neighbor_idx, depth + 1))
+
+            # If you also want “incoming edges = callers” in the neighborhood,
+            # do an in-edges expansion:
+            for pred_idx, _, _ in G.in_edges(current_idx):
+                if pred_idx not in visited:
+                    visited.add(pred_idx)
+                    queue.append((pred_idx, depth + 1))
+
+    # 2) Create the subgraph from the visited node indices
+    subgraph = G.subgraph(node_indices)
+    return subgraph
+
+
+def main_convert(filepath: str, save_path: str) -> None:
+    """
+    Convert a PyDiGraph into the adjacency-based JSON format
+    that `kyn` (and NetworkX's json_graph) expects.
+
+    Writes one JSON file per node (function) in the graph.
+    """
+    os.makedirs(save_path, exist_ok=True)
+
+    logger.info("[+] Importing global call graph...")
+    graph_path = os.path.join(SAVE_PATH, filepath)
+    if not os.path.exists(graph_path):
+        raise FileNotFoundError(f"Graph file not found: {graph_path}")
+
+    G = import_call_graph_from_json(graph_path)
+    logger.info(f"[+] Loaded global call graph from {graph_path}")
+
+    for idx, payload in tqdm(
+        enumerate(G.nodes()),
+        total=G.num_nodes(),
+        desc="Converting global graph to subgraphs",
+        mininterval=1.0,
+    ):
+        # Get subgraph for the current node
+        subgraph = extract_call_graphlet(G, idx, max_depth=2)
+
+        adjacency = []
+        nodes_data = []
+
+        total_edges = subgraph.num_edges()
+
+        for i, node_payload in enumerate(subgraph.nodes()):
+            neighbors = []
+            for src, dst, _ in subgraph.out_edges(i):
+                if src == i:
+                    neighbors.append({"id": dst})
+            adjacency.append(neighbors)
+
+            in_deg = subgraph.in_degree(i)
+            out_deg = subgraph.out_degree(i)
+
+            node_dict = {
+                "id": i,
+                "funcName": node_payload["name"],
+                "functionFeatureSubset": {
+                    "name": node_payload["name"],
+                    "ninstrs": node_payload["ninstrs"],
+                    "edges": total_edges,
+                    "indegree": in_deg,
+                    "outdegree": out_deg,
+                    "nlocals": node_payload["nlocals"],
+                    "nargs": node_payload["nargs"],
+                    "signature": f"{node_payload['name']}(...)",
+                },
+            }
+            nodes_data.append(node_dict)
+
+        graph_json = {
+            "directed": "True",
+            "multigraph": False,
+            "graph": [],
+            "adjacency": adjacency,
+            "nodes": nodes_data,
+        }
+
+        # Construct a filename for each node’s subgraph
+        filename = os.path.join(save_path, f"{payload['name']}_subgraph.json")
+        try:
+            with open(filename, "w") as f:
+                json.dump(graph_json, f, indent=None)
+        except OSError:
+            # Filename too long
             continue
-    print("Processing complete.")
+
+
+def main_import(filepath: str) -> None:
+    logger.info("[+] Importing global call graph...")
+    graph_path = os.path.join(SAVE_PATH, filepath)
+    if not os.path.exists(graph_path):
+        raise FileNotFoundError(f"Graph file not found: {graph_path}")
+
+    G = import_call_graph_from_json(graph_path)
+    logger.info(f"[+] Loaded global call graph from {graph_path}")
+
+    target_func_addr = 0x0000000101850D1E
+    subgraph = extract_call_graphlet(G, target_func_addr, max_depth=2)
+    logger.debug(f"Subgraph for 0x{target_func_addr:x}")
+
+    edge_centrality = rx.edge_betweenness_centrality(subgraph, normalized=False)
+    logger.debug(f"Edge betweenness scores: {dict(edge_centrality)}")
+
+    target_func_idx = -1
+    for idx, payload in enumerate(G.nodes()):
+        if payload["addr"] == target_func_addr:
+            target_func_idx = idx
+            break
+    if target_func_idx < 0:
+        raise ValueError(f"Function addr 0x{target_func_addr:x} not in global graph.")
+
+    indegree = G.in_degree(target_func_idx)
+    outdegree = G.out_degree(target_func_idx)
+    logger.debug(f"Indegree: {indegree}, Outdegree: {outdegree}")
+
+    callee = get_callees(target_func_addr)
+    logger.debug(f"Callees: {[hex(addr) for addr in callee]}")
+    caller = get_callers(target_func_addr)
+    logger.debug(f"Callers: {[hex(addr) for addr in caller]}")
+
+    # Example: run further analysis with the imported graph
+    # ...
+    # e.g., subgraph = extract_call_graphlet(G, 0x12345678, max_depth=2)
+    # edge_weights = compute_edge_weights(subgraph)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Manage a global call graph for IDA.")
+    parser.add_argument(
+        "--mode",
+        choices=["export", "import", "convert"],
+        required=True,
+        help="Select whether to export a new global call graph or import an existing one.",
+    )
+    parser.add_argument(
+        "--max-funcs",
+        type=int,
+        default=None,
+        help="Limit number of functions processed for testing",
+    )
+    parser.add_argument(
+        "--filepath",
+        type=str,
+        default=None,
+        help="Path to the JSON file containing the global call graph",
+    )
+    parser.add_argument(
+        "--save-path",
+        type=str,
+        default=None,
+        help="Path to save the subgraphs",
+    )
+
+    args = parser.parse_args()
+
+    if args.mode == "export":
+        logger.info("[+] Building and exporting global call graph...")
+        G = build_global_call_graph(max_funcs=args.max_funcs)
+        time = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        output_path = os.path.join(SAVE_PATH, f"global_call_graph_export_{time}.json")
+        export_call_graph_to_json(G, output_path)
+        logger.info(f"[+] Exported global call graph to {output_path}")
+    elif args.mode == "import":
+        if args.filepath is None:
+            logger.error(
+                "[!] Please provide a filepath to the JSON file containing the global call graph"
+            )
+            return
+
+        main_import(args.filepath)
+    elif args.mode == "convert":
+        if args.filepath is None:
+            logger.error(
+                "[!] Please provide a filepath to the JSON file containing the global call graph"
+            )
+            return
+        if args.save_path is None:
+            logger.error("[!] Please provide a save path to save the subgraphs")
+            return
+
+        main_convert(args.filepath, args.save_path)
 
 
 if __name__ == "__main__":
+    logger.info("Starting...")
     main()
