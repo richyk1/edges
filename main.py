@@ -1,5 +1,6 @@
 import datetime
 import json
+import logging
 import os
 from typing import Any, Dict, Set, Tuple, cast
 
@@ -7,19 +8,21 @@ import idaapi
 import idautils
 import idc
 import rustworkx as rx
+import itertools
 
+logger = logging.getLogger(__name__)
+
+
+logging.basicConfig(filename="", level=logging.INFO)
+logger.info("Started")
 # Set up an output directory.
 DATE = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
 
 # TODO: Change the SAVE_PATH to your desired output directory.
-VERSION = "1.27.2"
-SAVE_PATH = os.path.join(
-    os.path.expanduser("~"), "Github", "edges", "cgns", "cgn_" + VERSION
-)
+VERSION = "1.35.2_test"
+SAVE_PATH = os.path.join(os.path.expanduser("~"), "Github", "edges")
 os.makedirs(SAVE_PATH, exist_ok=True)
 
-# -------------------------------------------------------------------
-# Improvement 1: Cache demangled names.
 _demangle_cache: Dict[str, str] = {}
 
 
@@ -33,20 +36,30 @@ def demangle_function_name(name: str) -> str:
     return result
 
 
-# -------------------------------------------------------------------
-# Improvement 2: Precompute code references.
 global_callers: Dict[int, Set[int]] = {}
 global_callees: Dict[int, Set[int]] = {}
 
+ida_funcs = itertools.tee(idautils.Functions(), 4)
+
 
 def precompute_references() -> None:
-    for func_addr in idautils.Functions():
-        global_callers[func_addr] = set(idautils.CodeRefsTo(func_addr, 0))
-        global_callees[func_addr] = set(idautils.CodeRefsFrom(func_addr, 0))
+    for func_addr in ida_funcs[0]:
+        # For callers: XrefsTo returns xref objects.
+        # Use getattr to safely get the 'frm' attribute and ensure it's an int.
+        global_callers[func_addr] = {
+            frm
+            for xref in idautils.XrefsTo(func_addr, 0)
+            if (frm := getattr(xref, "frm", None)) is not None and isinstance(frm, int)
+        }
+        # For callees: XrefsFrom returns xref objects.
+        # Use getattr to safely get the 'to' attribute and ensure it's an int.
+        global_callees[func_addr] = {
+            to
+            for xref in idautils.XrefsFrom(func_addr, 0)
+            if (to := getattr(xref, "to", None)) is not None and isinstance(to, int)
+        }
 
 
-# -------------------------------------------------------------------
-# (Existing helper functions remain unchanged.)
 def get_instruction_count_bb(func_addr: int) -> int:
     func = idaapi.get_func(func_addr)
     if not func:
@@ -104,16 +117,11 @@ def get_function_arguments(func_addr: int) -> int:
         return 0
 
 
-# -------------------------------------------------------------------
-# Improvement 3: Reuse global graph data.
-# Build the global call graph with rustworkx.
-# Since rustworkx uses integer indices (assigned in order of node addition),
-# we first build a mapping from function address to node index.
 def build_call_graph() -> Tuple[rx.PyDiGraph, Dict[int, int]]:
     G = rx.PyDiGraph()
     func_to_node: Dict[int, int] = {}
     # First pass: add nodes.
-    for func_addr in idautils.Functions():
+    for func_addr in ida_funcs[1]:
         func_name = idc.get_func_name(func_addr)
         node_payload = {
             "name": func_name,
@@ -127,7 +135,7 @@ def build_call_graph() -> Tuple[rx.PyDiGraph, Dict[int, int]]:
         node_index = G.add_node(node_payload)
         func_to_node[func_addr] = node_index
     # Second pass: add edges.
-    for func_addr in idautils.Functions():
+    for func_addr in ida_funcs[2]:
         if func_addr not in func_to_node:
             continue
         u = func_to_node[func_addr]
@@ -152,9 +160,6 @@ def build_call_graph() -> Tuple[rx.PyDiGraph, Dict[int, int]]:
     return G, func_to_node
 
 
-# -------------------------------------------------------------------
-# Improvement 4: Avoid duplicate subgraph constructions.
-# Compute the union of callers, callees, and callees-of-callees once.
 def get_call_graphlet_neighbors(func_addr: int) -> Set[int]:
     callers = global_callers.get(func_addr, set())
     callees = global_callees.get(func_addr, set())
@@ -164,8 +169,6 @@ def get_call_graphlet_neighbors(func_addr: int) -> Set[int]:
     return callers | callees | callees_of_callees | {func_addr}
 
 
-# In rustworkx, to get a subgraph induced on a set of nodes, we can call G.subgraph(node_indices).
-# Also, rustworkx provides an edge betweenness function. (Here we assume it is called as shown.)
 def compute_edge_weights(
     G: rx.PyDiGraph, func_addr: int, func_to_node: Dict[int, int]
 ) -> Dict[Any, float]:
@@ -173,9 +176,7 @@ def compute_edge_weights(
     if len(neighbors) > 1000:
         raise ValueError("Call graphlet too large.")
     # Convert function addresses to rustworkx node indices as a list.
-    neighbor_nodes = [
-        func_to_node[addr] for addr in neighbors if addr in func_to_node
-    ]
+    neighbor_nodes = [func_to_node[addr] for addr in neighbors if addr in func_to_node]
     subgraph = G.subgraph(neighbor_nodes)
     # Compute edge betweenness centrality.
     edge_centrality = rx.edge_betweenness_centrality(subgraph, normalized=True)
@@ -202,8 +203,7 @@ def export_function_json(
             "functionFeatureSubset": {
                 "name": payload.get("name", ""),
                 "ninstrs": payload.get("ninstrs", 0),
-                "edges": payload.get("indegree", 0)
-                + payload.get("outdegree", 0),
+                "edges": payload.get("indegree", 0) + payload.get("outdegree", 0),
                 "indegree": payload.get("indegree", 0),
                 "outdegree": payload.get("outdegree", 0),
                 "nlocals": payload.get("nlocals", 0),
@@ -242,24 +242,25 @@ def export_function_json(
     print(f"Saved JSON for function {target_name} to {out_filename}")
 
 
-# -------------------------------------------------------------------
-# Main function.
 def main() -> None:
     print(f"Saving JSON files to: {SAVE_PATH}")
     precompute_references()
     call_graph, func_to_node = build_call_graph()
-    functions = idautils.Functions()
+    functions = ida_funcs[3]
+    functions = iter(["0x10185091A"])
     file_index = 0
     while True:
         func_addr = next(functions, None)
         if func_addr is None:
             break
+
         func_name = idc.get_func_name(func_addr)
-        print(f"Processing function at 0x{func_addr:x} ({func_name})")
+        logger.debug(f"Processing function at 0x{func_addr:x} ({func_name})")
         try:
-            edge_weights = compute_edge_weights(
-                call_graph, func_addr, func_to_node
-            )
+            edge_weights = compute_edge_weights(call_graph, func_addr, func_to_node)
+            logger.debug(f"Computed edge weights for 0x{func_addr:x}")
+            logger.debug(f"Edge weights: {edge_weights}")
+
             neighbors = get_call_graphlet_neighbors(func_addr)
             # Convert function addresses to rustworkx node indices as a list.
             neighbor_nodes = [
