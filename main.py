@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
-
 from headless_ida import HeadlessIda
 
-# Initialize HeadlessIda.
 headlessida = HeadlessIda(
     "/Applications/IDA Professional 9.0.app/Contents/MacOS/idat",
-    "/Users/kerosene/Desktop/eu4_1.27.2.i64",
+    "/Users/kerosene/Github/edges/ida_projects/eu4_exe_1.36.2.i64",
 )
-
 import idautils
 import idaapi
 import idc
+
 import os
 import argparse
 import datetime
@@ -23,6 +21,7 @@ from typing import Set
 from functools import lru_cache
 from tqdm import tqdm
 from collections import deque
+from pathlib import Path
 
 
 # Set up logger.
@@ -183,29 +182,32 @@ def import_call_graph_from_json(filepath: str) -> rx.PyDiGraph:
     """
     Reconstruct a PyDiGraph from the JSON that was exported.
     """
-    with open(filepath, "rb") as f:
-        graph_data = orjson.loads(f.read())
+    # Read and parse the JSON in one step using Path for brevity.
+    graph_data = orjson.loads(Path(filepath).read_bytes())
 
+    # Create a new directed graph.
     G = rx.PyDiGraph(multigraph=False)
-    old_index_to_new = {}
 
-    # Re-create nodes.
-    for node_info in graph_data["nodes"]:
-        payload = {
-            "addr": node_info["addr"],
-            "name": node_info["name"],
-            "ninstrs": node_info["ninstrs"],
-            "nlocals": node_info["nlocals"],
-            "nargs": node_info["nargs"],
-        }
-        new_idx = G.add_node(payload)
-        old_index_to_new[node_info["index"]] = new_idx
+    # Build the mapping from the old node indices to the new indices,
+    # constructing each node's payload on the fly.
+    old_index_to_new = {
+        node_info["index"]: G.add_node(
+            {
+                "addr": node_info["addr"],
+                "name": node_info["name"],
+                "ninstrs": node_info["ninstrs"],
+                "nlocals": node_info["nlocals"],
+                "nargs": node_info["nargs"],
+            }
+        )
+        for node_info in graph_data["nodes"]
+    }
 
-    # Re-create edges.
+    # Re-create the edges using the mapping.
     for edge_info in graph_data["edges"]:
-        u_old = edge_info["source"]
-        v_old = edge_info["target"]
-        G.add_edge(old_index_to_new[u_old], old_index_to_new[v_old], None)
+        src = old_index_to_new[edge_info["source"]]
+        tgt = old_index_to_new[edge_info["target"]]
+        G.add_edge(src, tgt, None)
 
     return G
 
@@ -213,8 +215,6 @@ def import_call_graph_from_json(filepath: str) -> rx.PyDiGraph:
 # ---------------------------------------------------------------------
 # Subgraph Extraction and Conversion
 # ---------------------------------------------------------------------
-
-
 def extract_call_graphlet(
     G: rx.PyDiGraph, func_idx: int, max_depth: int = 2
 ) -> rx.PyDiGraph:
@@ -259,55 +259,44 @@ def main_convert(filepath: str, save_path: str) -> None:
     if not os.path.exists(graph_path):
         raise FileNotFoundError(f"Graph file not found: {graph_path}")
 
-    G = import_call_graph_from_json(graph_path)
+    G: rx.PyDiGraph = import_call_graph_from_json(graph_path)
     logger.info(f"[+] Loaded global call graph from {graph_path}")
 
-    for idx, payload in tqdm(
-        enumerate(G.nodes()),
+    for subgraph_idx in tqdm(
+        G.node_indices(),
         total=G.num_nodes(),
         desc="Converting global graph to subgraphs",
         mininterval=1.0,
     ):
-        subgraph = extract_call_graphlet(G, idx, max_depth=2)
-        total_edges = subgraph.num_edges()
+        payload = G.get_node_data(subgraph_idx)
+        subgraph: rx.PyDiGraph = extract_call_graphlet(G, subgraph_idx, max_depth=2)
 
-        # Build adjacency list with a list comprehension.
-        adjacency = [
-            [{"id": dst} for src, dst, _ in subgraph.out_edges(i) if src == i]
-            for i in range(subgraph.num_nodes())
-        ]
+        nodes = subgraph.node_indices()
+        node_map = {node_id: i for i, node_id in enumerate(nodes)}
 
-        nodes_data = []
-        for i, node_payload in enumerate(subgraph.nodes()):
-            node_dict = {
-                "id": i,
-                "funcName": node_payload["name"],
-                "functionFeatureSubset": {
-                    "name": node_payload["name"],
-                    "ninstrs": node_payload["ninstrs"],
-                    "edges": total_edges,
-                    "indegree": subgraph.in_degree(i),
-                    "outdegree": subgraph.out_degree(i),
-                    "nlocals": node_payload["nlocals"],
-                    "nargs": node_payload["nargs"],
-                    "signature": f"{node_payload['name']}(...)",
-                },
-            }
-            nodes_data.append(node_dict)
-
-        graph_json = {
-            "directed": "True",
-            "multigraph": False,
-            "graph": [],
-            "adjacency": adjacency,
-            "nodes": nodes_data,
+        graph_data = {
+            "nodes": [
+                {
+                    "id": node_map[node_id],
+                    "ninstrs": subgraph.get_node_data(node_id)["ninstrs"],
+                    "edges": subgraph.out_degree(node_id) + subgraph.in_degree(node_id),
+                    "indegree": subgraph.in_degree(node_id),
+                    "outdegree": subgraph.out_degree(node_id),
+                    "nlocals": subgraph.get_node_data(node_id)["nlocals"],
+                    "nargs": subgraph.get_node_data(node_id)["nargs"],
+                }
+                for node_id in nodes
+            ],
+            "edges": [
+                {"source": node_map[u], "target": node_map[v]}
+                for u, v in subgraph.edge_list()
+            ],
         }
 
-        # Construct a (sanitized) filename for each subgraph.
         filename = os.path.join(save_path, f"{payload['name']}_subgraph.json")
         try:
             with open(filename, "wb") as f:
-                f.write(orjson.dumps(graph_json))
+                f.write(orjson.dumps(graph_data))
         except OSError:
             # Filename too long, skip this node.
             continue
@@ -360,7 +349,7 @@ def main():
     parser = argparse.ArgumentParser(description="Manage a global call graph for IDA.")
     parser.add_argument(
         "--mode",
-        choices=["export", "import", "convert", "parallel"],
+        choices=["export", "import", "convert"],
         required=True,
         help="Select whether to export a new global call graph or import an existing one.",
     )
