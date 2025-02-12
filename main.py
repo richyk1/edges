@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
+
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
 from headless_ida import HeadlessIda
 
 headlessida = HeadlessIda(
-    "/Applications/IDA Professional 9.0.app/Contents/MacOS/idat",
-    "/Users/kerosene/Github/edges/ida_projects/eu4_exe_1.36.2.i64",
+    os.getenv("IDA_DIR"),
+    os.getenv("BINARY_PATH"),
 )
 import idautils
 import idaapi
 import idc
 
-import os
 import argparse
 import datetime
 import logging
@@ -29,7 +34,7 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.DEBUG)
 
 # Set up an output directory.
-SAVE_PATH = os.path.join(os.path.expanduser("~"), "Github", "edges")
+SAVE_PATH = os.getcwd()
 os.makedirs(SAVE_PATH, exist_ok=True)
 
 
