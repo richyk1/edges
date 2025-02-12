@@ -20,6 +20,7 @@ import datetime
 import logging
 import rustworkx as rx
 import orjson
+import hashlib
 
 from collections import deque
 from typing import Set
@@ -44,7 +45,7 @@ os.makedirs(SAVE_PATH, exist_ok=True)
 @lru_cache(maxsize=None)
 def demangle_function_name(name: str) -> str:
     disable_mask = idc.get_inf_attr(idc.INF_SHORT_DN)
-    demangled = idaapi.demangle_name(name, disable_mask)
+    demangled = idc.demangle_name(name, disable_mask)
     return demangled if demangled is not None else name
 
 
@@ -224,39 +225,34 @@ def extract_call_graphlet(
     G: rx.PyDiGraph, func_idx: int, max_depth: int = 2
 ) -> rx.PyDiGraph:
     """
-    Return a subgraph of `G` containing the node at index `func_idx`
-    and up to `max_depth` levels of its neighbors.
+    Return a subgraph representing the call graphlet as defined in the paper:
+      - the target function itself,
+      - its direct callers (incoming neighbors),
+      - its direct callees (outgoing neighbors),
+      - and the callees of its direct callees (second-level outgoing neighbors).
+    This excludes callers of callers.
     """
-    node_indices = []
-    visited = set()
-    queue = deque()
+    # Start with the target node.
+    nodes = {func_idx}
 
-    queue.append((func_idx, 0))
-    visited.add(func_idx)
+    # Get direct callers and callees.
+    direct_callers = {pred for pred, _, _ in G.in_edges(func_idx)}
+    direct_callees = {nbr for _, nbr, _ in G.out_edges(func_idx)}
+    nodes.update(direct_callers)
+    nodes.update(direct_callees)
 
-    while queue:
-        current_idx, depth = queue.popleft()
-        node_indices.append(current_idx)
+    # For each direct callee, add its callees (second-level) only.
+    for callee in direct_callees:
+        second_level_callees = {nbr for _, nbr, _ in G.out_edges(callee)}
+        nodes.update(second_level_callees)
 
-        if depth < max_depth:
-            # Expand to outgoing neighbors.
-            for _, neighbor_idx, _ in G.out_edges(current_idx):
-                if neighbor_idx not in visited:
-                    visited.add(neighbor_idx)
-                    queue.append((neighbor_idx, depth + 1))
-            # Optionally expand to incoming neighbors.
-            for pred_idx, _, _ in G.in_edges(current_idx):
-                if pred_idx not in visited:
-                    visited.add(pred_idx)
-                    queue.append((pred_idx, depth + 1))
-
-    return G.subgraph(node_indices)
+    return G.subgraph(list(nodes))
 
 
 def main_convert(filepath: str, save_path: str) -> None:
     """
     Convert the global call graph to the adjacency-based JSON format
-    (one file per node's subgraph).
+    (one file per node's subgraph), while deduplicating common call graphlets.
     """
     os.makedirs(save_path, exist_ok=True)
     logger.info("[+] Importing global call graph...")
@@ -266,6 +262,9 @@ def main_convert(filepath: str, save_path: str) -> None:
 
     G: rx.PyDiGraph = import_call_graph_from_json(graph_path)
     logger.info(f"[+] Loaded global call graph from {graph_path}")
+
+    # A set to keep track of seen subgraph fingerprints.
+    seen_fingerprints = set()
 
     for subgraph_idx in tqdm(
         G.node_indices(),
@@ -298,7 +297,31 @@ def main_convert(filepath: str, save_path: str) -> None:
             ],
         }
 
-        filename = os.path.join(save_path, f"{payload['name']}_subgraph.json")
+        # Compute a fingerprint (hash) of the graph data.
+        # We use orjson with sorted keys for a canonical representation.
+        fingerprint = hashlib.sha256(
+            orjson.dumps(graph_data, option=orjson.OPT_SORT_KEYS)
+        ).hexdigest()
+
+        if fingerprint in seen_fingerprints:
+            # Duplicate call graphlet found; skip saving.
+            continue
+        seen_fingerprints.add(fingerprint)
+
+        demangled_name = demangle_function_name(payload["name"])
+        if (
+            demangled_name == payload["name"]
+            or "std::" in demangled_name
+            or "boost::" in demangled_name
+            or "tbb::" in demangled_name
+        ):
+            # Likely a library function; skip.
+            continue
+
+        # Remove parentheses from the function name.
+        demangled_name = demangled_name.split("(")[0]
+
+        filename = os.path.join(save_path, f"{demangled_name}_subgraph.json")
         try:
             with open(filename, "wb") as f:
                 f.write(orjson.dumps(graph_data))
