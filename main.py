@@ -11,9 +11,11 @@ headlessida = HeadlessIda(
     os.getenv("IDA_DIR"),
     os.getenv("BINARY_PATH"),
 )
-import idautils
-import idaapi
-import idc
+
+# ignoring linting errors because these packages become available after initializing headlessIda
+import idautils  # type: ignore
+import idaapi  # type: ignore
+import idc  # type: ignore
 
 import argparse
 import datetime
@@ -112,7 +114,7 @@ def get_function_arguments(func_addr: int) -> int:
 # ---------------------------------------------------------------------
 # Global Call Graph Build / Export / Import
 # ---------------------------------------------------------------------
-def build_global_call_graph(max_funcs: int = None) -> rx.PyDiGraph:
+def build_global_call_graph(max_funcs: int = -1) -> rx.PyDiGraph:
     """
     Build and return a directed PyDiGraph (global call graph)
     for all recognized functions in the IDB.
@@ -121,7 +123,7 @@ def build_global_call_graph(max_funcs: int = None) -> rx.PyDiGraph:
     func_to_node = {}
 
     all_funcs = list(idautils.Functions())
-    if max_funcs:
+    if max_funcs == -1:
         all_funcs = all_funcs[:max_funcs]
 
     total_funcs = len(all_funcs)
@@ -221,9 +223,7 @@ def import_call_graph_from_json(filepath: str) -> rx.PyDiGraph:
 # ---------------------------------------------------------------------
 # Subgraph Extraction and Conversion
 # ---------------------------------------------------------------------
-def extract_call_graphlet(
-    G: rx.PyDiGraph, func_idx: int, max_depth: int = 2
-) -> rx.PyDiGraph:
+def extract_call_graphlet(G: rx.PyDiGraph, func_idx: int) -> rx.PyDiGraph:
     """
     Return a subgraph representing the call graphlet as defined in the paper:
       - the target function itself,
@@ -270,10 +270,13 @@ def main_convert(filepath: str, save_path: str) -> None:
         G.node_indices(),
         total=G.num_nodes(),
         desc="Converting global graph to subgraphs",
-        mininterval=1.0,
+        mininterval=3.0,
     ):
         payload = G.get_node_data(subgraph_idx)
-        subgraph: rx.PyDiGraph = extract_call_graphlet(G, subgraph_idx, max_depth=2)
+        subgraph: rx.PyDiGraph = extract_call_graphlet(G, subgraph_idx)
+        if subgraph.num_edges() == 0:
+            # we want subgraphs with more than 0 edges for edge weights
+            continue
 
         nodes = subgraph.node_indices()
         node_map = {node_id: i for i, node_id in enumerate(nodes)}
@@ -308,18 +311,29 @@ def main_convert(filepath: str, save_path: str) -> None:
             continue
         seen_fingerprints.add(fingerprint)
 
+        # for stripped binaries we need to have a way to create signatures
+        # probably a fork from https://github.com/kweatherman/sigmakerex
+        # filter for macos binaries that are unstripped
         demangled_name = demangle_function_name(payload["name"])
         if (
-            demangled_name == payload["name"]
-            or "std::" in demangled_name
+            "std::" in demangled_name
             or "boost::" in demangled_name
             or "tbb::" in demangled_name
+            or "__acrt" in demangled_name
+            or "__crt" in demangled_name
         ):
             # Likely a library function; skip.
             continue
 
-        # Remove parentheses from the function name.
-        demangled_name = demangled_name.split("(")[0]
+        if demangled_name == payload["name"]:
+            # for windows binaries we look for functions with sub_ and ifn ot found we skip
+            try:
+                demangled_name = demangled_name.split("sub_")[1]
+            except:
+                continue
+        else:
+            # Remove parentheses from the function name e.g main(int a).
+            demangled_name = demangled_name.split("(")[0]
 
         filename = os.path.join(save_path, f"{demangled_name}_subgraph.json")
         try:
@@ -343,7 +357,7 @@ def main_import(filepath: str) -> None:
     logger.info(f"[+] Loaded global call graph from {graph_path}")
 
     target_func_addr = 0x0000000101850D1E
-    subgraph = extract_call_graphlet(G, target_func_addr, max_depth=2)
+    subgraph = extract_call_graphlet(G, target_func_addr)
     logger.debug(f"Subgraph for 0x{target_func_addr:x}")
 
     edge_centrality = rx.edge_betweenness_centrality(subgraph, normalized=False)

@@ -1,1 +1,1 @@
-
+BINARY_PATH=ida_projects/eu4_arm_1.35.2.i64 python main.py --mode convert --filepath eu4_arm_1.35.2_gcg.json --save-path cgn/eu4_arm_1.35.2_test
