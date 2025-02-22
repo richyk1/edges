@@ -351,27 +351,30 @@ def get_function_signature(func_addr, max_bytes=32):
     pattern = []
     func = idaapi.get_func(func_addr)
     if not func:
-        print(f"[ERROR] Function at {func_addr:#x} not found.")
-        return None
+        raise ValueError(f"Function at {func_addr:#x} not found.")
 
     total_bytes = 0
+    # Allocate a single instruction object to reuse in each iteration
+    insn = ida_ua.insn_t()
+
     for ea in idautils.FuncItems(func.start_ea):
         if total_bytes >= max_bytes:
             break
 
-        insn = ida_ua.insn_t()
         if ida_ua.decode_insn(insn, ea) == 0:
-            print(f"[ERROR] Error decoding instruction at {ea:#x}")
+            raise ValueError(f"Failed to decode instruction at {ea:#x}")
+
+        # Retrieve the instruction bytes and convert to a mutable bytearray
+        insn_bytes = ida_bytes.get_bytes(ea, insn.size)
+        if insn_bytes is None:
             continue
+        bytes_ = bytearray(insn_bytes)
 
-        bytes_ = bytearray(ida_bytes.get_bytes(ea, insn.size))
-
-        for i in range(len(insn.ops)):  # type: ignore
-            op = insn.ops[i]  # type: ignore
+        # Iterate over each operand (using direct iteration if supported)
+        for op in insn.ops:  # type: ignore
             if op.type == ida_ua.o_void:
                 break
 
-            # Check if this operand can contain a build-specific address or offset:
             if op.type in (
                 ida_ua.o_near,
                 ida_ua.o_far,
@@ -383,129 +386,85 @@ def get_function_signature(func_addr, max_bytes=32):
                 if op.offb == idaapi.BADADDR:
                     continue
 
-                FL_RIPREL = 0x20  # for x86_64 RIP-relative
-
-                # Check if it is RIP-relative
-                # IDA sets FL_RIPREL in specflag1 for x86-64 RIP-relative operands
-                is_rip_relative = op.type == ida_ua.o_displ and bool(
+                FL_RIPREL = 0x20  # x86_64 RIP-relative flag
+                is_rip_relative = op.type == ida_ua.o_displ and (
                     op.specflag1 & FL_RIPREL
                 )
-
-                # Determine mask size:
-                if op.type in (ida_ua.o_near, ida_ua.o_far):
-                    # calls/jumps typically store a 4-byte offset in x86/x64
-                    size = 4
-                elif is_rip_relative:
-                    # 64-bit RIP-relative displacements are 4 bytes
+                # Determine size for masking
+                if op.type in (ida_ua.o_near, ida_ua.o_far) or is_rip_relative:
                     size = 4
                 else:
-                    # fallback: derive from operand data type
                     size = ida_ua.get_dtype_size(op.dtype)
                     if size < 1:
-                        size = 4  # fallback if IDA doesn't know
+                        size = 4
 
-                # Mask the bytes
-                for j in range(op.offb, min(op.offb + size, len(bytes_))):
-                    bytes_[j] = 0x00
+                # Use slicing to zero out the bytes within the operand’s range
+                end_index = op.offb + size
+                if end_index > len(bytes_):
+                    end_index = len(bytes_)
+                bytes_[op.offb : end_index] = b"\x00" * (end_index - op.offb)
 
-        # Take as many bytes as we still need
+        # Calculate how many bytes we can still add from this instruction
         remaining = max_bytes - total_bytes
         if remaining <= 0:
             break
 
         current_chunk = bytes_[:remaining]
-        pattern += [f"{b:02X}" if b != 0 else "?" for b in current_chunk]
+        # Extend pattern: convert each byte to hex unless it's zero (then use wildcard)
+        pattern.extend([f"{b:02X}" if b != 0 else "?" for b in current_chunk])
         total_bytes += len(current_chunk)
 
-    # Trim trailing wildcards
+    # Remove any trailing wildcards
     while pattern and pattern[-1] == "?":
         pattern.pop()
 
     if not pattern:
         raise ValueError(f"Function at {func_addr:#x} has no instructions.")
 
-    byte_pattern = " ".join(pattern)
-
-    string_refs = []
-    filtered_strings = ["byte", "DJ"]
-    for ea in idautils.FuncItems(func.start_ea):
-        for ref in idautils.DataRefsFrom(ea):
-            name = idc.get_name(ref)
-            logger.debug(f"Found string reference: {name} @ {ea:#x}")
-            if name and not any(f in name for f in filtered_strings):
-                string_refs.append(name)
-
-    # Include up to 3 unique strings in signature
-    unique_strings = list(set(string_refs))[:3]
-    string_part = "|".join(unique_strings)
-
-    return f"{byte_pattern}|STR:{string_part}"
+    return " ".join(pattern)
 
 
-def signature_search(signature: str) -> list[str]:
-    """Search for ALL functions matching the given signature."""
+def signature_search(signature: str, start_ea: int, end_ea: int) -> list[int]:
+    """Search for functions matching the given signature using find_bytes."""
+    # Convert pattern string to byte sequence and mask
+    byte_pattern = bytearray()
+    mask = bytearray()
+    for part in signature.split():
+        if part == "?":
+            byte_pattern.append(0x00)
+            mask.append(0x00)  # Wildcard byte
+        else:
+            byte_pattern.append(int(part, 16))
+            mask.append(0xFF)  # Fixed byte
+
     matches = []
+    current_ea = start_ea
+    pattern_len = len(byte_pattern)
 
-    # Split signature into byte pattern and strings
-    parts = signature.split("|STR:")
-    byte_pattern = parts[0]
-    search_strings = parts[1].split("|") if len(parts) > 1 else []
+    while current_ea <= end_ea - pattern_len:
+        # Use find_bytes for faster searching with mask support
+        found_ea = ida_bytes.find_bytes(
+            bytes(byte_pattern),
+            current_ea,
+            range_end=end_ea,
+            mask=bytes(mask),
+            flags=ida_bytes.BIN_SEARCH_FORWARD | ida_bytes.BIN_SEARCH_NOSHOW,
+        )
 
-    # Search in all executable segments (not just the first .text/__text)
-    for seg_start in idautils.Segments():
-        seg_name = idc.get_segm_name(seg_start)
-        if seg_name not in [".text", "__text"]:
-            continue  # Skip non-code segments
+        if found_ea == idaapi.BADADDR:
+            break
 
-        start_ea = idc.get_segm_start(seg_start)
-        end_ea = idc.get_segm_end(seg_start)
+        # Verify we're at function start
+        func = idaapi.get_func(found_ea)
+        if func and func.start_ea == found_ea:
+            matches.append(found_ea)
+            if len(matches) > 1:  # Early exit for non-unique
+                return []
 
-        logger.debug(f"Searching segment {seg_name} @ {start_ea:x}-{end_ea:x}")
+        # Skip past this match position
+        current_ea = found_ea + 1
 
-        # Compile pattern once per segment
-        compiled_pattern = ida_bytes.compiled_binpat_vec_t()
-        err = ida_bytes.parse_binpat_str(compiled_pattern, start_ea, byte_pattern, 16)
-        if err:
-            logger.error(f"Pattern error in segment {seg_name}: {err}")
-            continue
-
-        # Iterative search until BADADDR
-        current_ea = start_ea
-        while current_ea < end_ea:
-            found_ea = ida_bytes.bin_search(
-                current_ea, end_ea, compiled_pattern, ida_bytes.BIN_SEARCH_FORWARD
-            )
-            if not found_ea or found_ea[0] == idaapi.BADADDR:
-                break
-
-            match_ea = found_ea[0]
-            matches.append(match_ea)
-            logger.debug(f"Found match @ {match_ea:x}")
-            current_ea = match_ea + 1  # Advance search start
-
-    logger.info(f"Found {len(matches)} unfiltered matches for signature: {signature}")
-
-    if len(matches) == 1:
-        return matches
-
-    # Filter matches by string presence
-    filtered = []
-    for candidate in matches:
-        has_all_strings = True
-        for s in search_strings:
-            found = False
-            for ref_ea in idautils.DataRefsTo(idc.get_name_ea_simple(s)):
-                if idc.get_func_attr(ref_ea, idc.FUNCATTR_START) == candidate:
-                    found = True
-                    break
-            if not found:
-                has_all_strings = False
-                break
-        if has_all_strings:
-            filtered.append(candidate)
-
-    logger.info(f"Filtered {len(matches)}→{len(filtered)} matches using strings")
-    return filtered
+    return matches
 
 
 # ---------------------------------------------------------------------
@@ -531,41 +490,63 @@ def main_import(filepath: str, target_func_addr: int) -> None:
     # if target_func_idx < 0:
     #     raise ValueError(f"Function addr 0x{target_func_addr:x} not in global graph.")
 
-    st = time.monotonic()
     # TESTING START
+    st = time.monotonic()
 
     random.seed(42)  # Set a fixed seed for reproducibility
     all_func_addrs = [payload["addr"] for payload in G.nodes()]
     func_addr_list = random.sample(
-        all_func_addrs, min(5, len(all_func_addrs))
+        all_func_addrs, min(100, len(all_func_addrs))
     )  # Sample up to 10 addresses
-    func_addr_list = [0x140E1E8E0]
+    # func_addr_list = [0x140E1E8E0]
 
-    for target_func_addr in func_addr_list:
-        _st = time.monotonic()
+    start_ea = None
+    end_ea = None
 
+    # Search in all executable segments (not just the first .text/__text)
+    for seg_start in idautils.Segments():
+        seg_name = idc.get_segm_name(seg_start)
+        if seg_name not in [".text", "__text"]:
+            continue  # Skip non-code segments
+
+        start_ea = idc.get_segm_start(seg_start)
+        end_ea = idc.get_segm_end(seg_start)
+
+    if start_ea is None or end_ea is None:
+        raise ValueError("Failed to find .text (__text) segment")
+    logger.info(f"Searching in segment @ {start_ea:x}-{end_ea:x}")
+
+    unique_signatures = set()
+    failed_signatures = set()
+    for target_func_addr in tqdm(func_addr_list, desc="Searching for signatures"):
         signature = get_function_signature(target_func_addr, max_bytes=40)
-        if signature is None:
-            raise ValueError(f"Function addr 0x{target_func_addr:x} not found.")
-
-        logger.info(f"Signature for 0x{target_func_addr:x}: {signature}")
-
-        matched_func_addr_list = signature_search(signature)
-        logger.info(
-            f"Found {len(matched_func_addr_list)} functions with matching signature"
+        if signature in failed_signatures:
+            continue
+        matched_func_addr_list = signature_search(
+            signature, start_ea=start_ea, end_ea=end_ea
         )
-        for addr in matched_func_addr_list:
-            logger.info(f"Found function at 0x{addr:x}")
+        if len(matched_func_addr_list) == 0:
+            failed_signatures.add(signature)
+        else:
+            unique_signatures.add(signature)
 
-        _et = time.monotonic()
-        logger.info(f"Time taken to search for signature: {_et - _st:.2f} seconds")
+    logger.debug(
+        f"From {len(func_addr_list)} functions, found {len(unique_signatures)} unique signatures"
+    )
+    logger.debug(
+        f"Unique signatures: {len(unique_signatures) / len(func_addr_list) * 100:.2f}%"
+    )
 
-        logger.info("")
-
-    # TESTING END
     et = time.monotonic()
     logger.info(f"Time taken to search for all signatures: {et - st:.2f} seconds")
+
+    # save the unique signatures to a file
+    with open("unique_signatures.txt", "w") as f:
+        for signature in unique_signatures:
+            f.write(signature + "\n")
+
     exit(0)
+    # TESTING END
 
     subgraph = extract_call_graphlet(G, target_func_addr)
     logger.debug(f"Subgraph for 0x{target_func_addr:x}")
