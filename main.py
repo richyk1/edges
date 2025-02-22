@@ -12,10 +12,12 @@ headlessida = HeadlessIda(
     os.getenv("BINARY_PATH"),
 )
 
-# ignoring linting errors because these packages become available after initializing headlessIda
-import idautils  # type: ignore
-import idaapi  # type: ignore
-import idc  # type: ignore
+import idautils
+import idaapi
+import idc
+import ida_ua
+import ida_bytes
+import ida_nalt
 
 import argparse
 import datetime
@@ -23,12 +25,11 @@ import logging
 import rustworkx as rx
 import orjson
 import hashlib
+import time
 
-from collections import deque
 from typing import Set
 from functools import lru_cache
 from tqdm import tqdm
-from collections import deque
 from pathlib import Path
 
 
@@ -51,12 +52,13 @@ def demangle_function_name(name: str) -> str:
     return demangled if demangled is not None else name
 
 
+# linter goes off on .frm because its not parsing the c++ proxy function correctly
 def get_callers(func_addr: int) -> Set[int]:
     return {
-        idc.get_func_attr(xref.frm, idc.FUNCATTR_START)
+        idc.get_func_attr(xref.frm, idc.FUNCATTR_START)  # type: ignore
         for xref in idautils.XrefsTo(func_addr, idaapi.XREF_USER)
-        if xref.type in (idaapi.fl_CN, idaapi.fl_CF, idaapi.fl_JN, idaapi.fl_JF)
-        and idc.get_func_attr(xref.frm, idc.FUNCATTR_START) != idc.BADADDR
+        if xref.type in (idaapi.fl_CN, idaapi.fl_CF, idaapi.fl_JN, idaapi.fl_JF)  # type: ignore
+        and idc.get_func_attr(xref.frm, idc.FUNCATTR_START) != idc.BADADDR  # type: ignore
     }
 
 
@@ -344,10 +346,82 @@ def main_convert(filepath: str, save_path: str) -> None:
             continue
 
 
+def get_function_signature(func_addr):
+    pattern = []
+    func = idaapi.get_func(func_addr)
+    if not func:
+        logger.error(f"[-] Function at {func_addr} not found.")
+        return None
+
+    for ea in idautils.FuncItems(func.start_ea):
+        insn = ida_ua.insn_t()
+        if ida_ua.decode_insn(insn, ea) == 0:
+            logger.error(f"[-] Error decoding instruction at {ea:x}")
+
+        bytes_ = bytearray(ida_bytes.get_bytes(ea, insn.size))
+
+        # Mask operands that are code references or immediate values
+        for i in range(8):  # IDA supports up to 8 operands
+            op = insn[i]  # Use indexing instead of direct iteration
+
+            if op.type == ida_ua.o_void:
+                break  # No more operands to process
+
+            if op.type in [ida_ua.o_near, ida_ua.o_far, ida_ua.o_imm]:
+                offset = op.offb
+                size = ida_ua.get_dtype_size(op.dtype)
+                for j in range(offset, offset + size):
+                    if j < len(bytes_):
+                        bytes_[j] = 0x00
+
+        # Format as IDA-style pattern
+        pattern.extend([f"{b:02X}" if b != 0 else "?" for b in bytes_])
+
+    return " ".join(pattern)
+
+
+def signature_search(signature: str):
+    """Search for a function with the given signature."""
+
+    # limit search in executable code segments e.g .text for x86 and __text for arm
+    start_ea = 0
+    end_ea = 0
+    for s in idautils.Segments():
+        start = idc.get_segm_start(s)
+        end = idc.get_segm_end(s)
+        if idc.get_segm_name(s) in [".text", "__text"]:
+            start_ea = start
+            end_ea = end
+            break
+
+    logger.info(
+        f"Searching for function with signature: {signature} in range {start_ea:x} - {end_ea:x}"
+    )
+
+    compiled_pattern = ida_bytes.compiled_binpat_vec_t()
+    err = ida_bytes.parse_binpat_str(compiled_pattern, start_ea, signature, 16)
+    if not err:
+        ea = ida_bytes.bin_search(
+            start_ea, end_ea, compiled_pattern, ida_bytes.BIN_SEARCH_FORWARD
+        )
+        logger.warning(f"EA  - {ea}")
+        ea = ea[0]
+
+        ok = ea != idaapi.BADADDR
+        if ok:
+            logger.debug(f"Succesfully found signature: {signature[:10]} at {ea:x}")
+        else:
+            logger.debug(f"Signature: {signature[:10]} not found")
+    else:
+        logger.error(f"Error parsing signature: {signature}")
+
+    return None
+
+
 # ---------------------------------------------------------------------
 # Import / Analysis Helpers
 # ---------------------------------------------------------------------
-def main_import(filepath: str) -> None:
+def main_import(filepath: str, target_func_addr: int) -> None:
     logger.info("[+] Importing global call graph...")
     graph_path = os.path.join(SAVE_PATH, filepath)
     if not os.path.exists(graph_path):
@@ -355,13 +429,6 @@ def main_import(filepath: str) -> None:
 
     G = import_call_graph_from_json(graph_path)
     logger.info(f"[+] Loaded global call graph from {graph_path}")
-
-    target_func_addr = 0x0000000101850D1E
-    subgraph = extract_call_graphlet(G, target_func_addr)
-    logger.debug(f"Subgraph for 0x{target_func_addr:x}")
-
-    edge_centrality = rx.edge_betweenness_centrality(subgraph, normalized=False)
-    logger.debug(f"Edge betweenness scores: {dict(edge_centrality)}")
 
     target_func_idx = next(
         (
@@ -374,14 +441,39 @@ def main_import(filepath: str) -> None:
     if target_func_idx < 0:
         raise ValueError(f"Function addr 0x{target_func_addr:x} not in global graph.")
 
+    # TESTING START
+
+    # Get the function signature
+    st = time.monotonic()
+
+    signature = get_function_signature(target_func_addr)
+    if signature is None:
+        raise ValueError(f"Function addr 0x{target_func_addr:x} not found.")
+
+    found_func_addr = signature_search(signature)
+
+    et = time.monotonic()
+    logger.info(f"Time taken to search for signature: {et - st:.2f} seconds")
+
+    exit(0)
+    # TESTING END
+
+    subgraph = extract_call_graphlet(G, target_func_addr)
+    logger.debug(f"Subgraph for 0x{target_func_addr:x}")
+
+    edge_centrality = rx.edge_betweenness_centrality(subgraph, normalized=False)
+    logger.debug(f"Num edge indices: {len(subgraph.edge_indices())}")
+    for edge in subgraph.edge_indices():
+        logger.debug(f"Edge {edge}: {edge_centrality[edge]}")
+
     indegree = G.in_degree(target_func_idx)
     outdegree = G.out_degree(target_func_idx)
     logger.debug(f"Indegree: {indegree}, Outdegree: {outdegree}")
 
     callee = get_callees(target_func_addr)
-    logger.debug(f"Callees: {[hex(addr) for addr in callee]}")
+    logger.debug(f"Callees ({len(callee)}): {[hex(addr) for addr in callee]}")
     caller = get_callers(target_func_addr)
-    logger.debug(f"Callers: {[hex(addr) for addr in caller]}")
+    logger.debug(f"Callers ({len(caller)}): {[hex(addr) for addr in caller]}")
 
 
 # ---------------------------------------------------------------------
@@ -413,6 +505,12 @@ def main():
         default=None,
         help="Path to save the subgraphs",
     )
+    parser.add_argument(
+        "--target-func-addr",
+        type=lambda x: int(x, 0),
+        default=None,
+        help="Address of the target function to analyze",
+    )
 
     args = parser.parse_args()
 
@@ -431,7 +529,11 @@ def main():
                 "[!] Please provide a filepath to the JSON file containing the global call graph"
             )
             return
-        main_import(args.filepath)
+        if args.target_func_addr is None:
+            logger.error("[!] Please provide a target function address")
+            return
+
+        main_import(args.filepath, args.target_func_addr)
     elif args.mode == "convert":
         if args.filepath is None:
             logger.error(
