@@ -89,7 +89,7 @@ def get_num_local_vars(func_addr: int) -> int:
             1 for member in idautils.StructMembers(frame_id) if "var" in member[1]
         )
     except Exception as e:
-        logger.error(f"[-] Error getting local variables for 0x{func_addr:x}: {e}")
+        logger.warning(f"[-] Error getting local variables for 0x{func_addr:x}: {e}")
         return 0
 
 
@@ -104,7 +104,7 @@ def get_function_arguments(func_addr: int) -> int:
             1 for member in idautils.StructMembers(frame_id) if "arg" in member[1]
         )
     except Exception as e:
-        logger.error(f"[-] Error getting arguments for 0x{func_addr:x}: {e}")
+        logger.warning(f"[-] Error getting arguments for 0x{func_addr:x}: {e}")
         return 0
 
 
