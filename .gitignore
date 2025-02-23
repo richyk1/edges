@@ -7,3 +7,4 @@ copy_common.sh
 ida_projects
 .env
 *.txt
+gcg_*

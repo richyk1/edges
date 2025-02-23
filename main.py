@@ -50,10 +50,10 @@ def demangle_function_name(name: str) -> str:
 
 def get_callers(func_addr: int) -> Set[int]:
     return {
-        idc.get_func_attr(xref.frm, idc.FUNCATTR_START)
+        idc.get_func_attr(xref.frm, idc.FUNCATTR_START)  # type: ignore
         for xref in idautils.XrefsTo(func_addr, idaapi.XREF_USER)
-        if xref.type in (idaapi.fl_CN, idaapi.fl_CF, idaapi.fl_JN, idaapi.fl_JF)
-        and idc.get_func_attr(xref.frm, idc.FUNCATTR_START) != idc.BADADDR
+        if xref.type in (idaapi.fl_CN, idaapi.fl_CF, idaapi.fl_JN, idaapi.fl_JF)  # type: ignore
+        and idc.get_func_attr(xref.frm, idc.FUNCATTR_START) != idc.BADADDR  # type: ignore
     }
 
 
@@ -324,6 +324,7 @@ def main():
     if args.mode == "export":
         logger.info("[+] Building global call graph...")
         G = build_global_call_graph(max_funcs=args.max_funcs)
+        # TODO: FIX!! this returns None
         try:
             identifier = args.save_path.split("/")[-1]
         except:
