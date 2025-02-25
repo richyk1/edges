@@ -10,17 +10,25 @@ import argparse
 import logging
 import time
 
-# Set up logger.
+from headless_ida import HeadlessIda
+
+headlessida = HeadlessIda(
+    os.getenv("IDA_DIR"),
+    os.getenv("BINARY_PATH"),
+)
+import ida_bytes
+import ida_ua
+import idaapi
+import idautils
+import ida_bytes
+import idaapi
+
+
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.DEBUG)
 
 
 def get_function_signature(func_addr, seg_start, seg_end, min_bytes=4, max_bytes=256):
-    import ida_bytes
-    import ida_ua
-    import idaapi
-    import idautils
-
     """
     Generate a signature for the function at func_addr that is as small as possible
     while uniquely matching the function start within [seg_start, seg_end).
@@ -105,9 +113,6 @@ def get_function_signature(func_addr, seg_start, seg_end, min_bytes=4, max_bytes
 
 
 def signature_search(signature: str, start_ea: int, end_ea: int) -> list[int]:
-    import ida_bytes
-    import idaapi
-
     """Search for functions matching the given signature using find_bytes."""
 
     # Convert pattern string to byte sequence and mask
@@ -148,6 +153,7 @@ def signature_search(signature: str, start_ea: int, end_ea: int) -> list[int]:
         # Skip past this match position
         current_ea = found_ea + 1
 
+    logger.debug(f"Found {len(matches)} matches for signature {signature}")
     return matches
 
 
@@ -209,12 +215,6 @@ def main():
 
 
 if __name__ == "__main__":
-    from headless_ida import HeadlessIda
-
-    headlessida = HeadlessIda(
-        os.getenv("IDA_DIR"),
-        os.getenv("BINARY_PATH"),
-    )
 
     logger.info("Starting...")
     main()

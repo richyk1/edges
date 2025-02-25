@@ -8,3 +8,8 @@ ida_projects
 .env
 *.txt
 gcg_*
+eu4_downloader
+gcgs
+.DS_STORE
+__pycache*
+string_refs/*

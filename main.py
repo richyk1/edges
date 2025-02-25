@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 
 import os
-from dotenv import load_dotenv
+from dotenv import load_dotenv  # type: ignore
 
 load_dotenv()
 
-from headless_ida import HeadlessIda
+from headless_ida import HeadlessIda  # type: ignore
 
 headlessida = HeadlessIda(
     os.getenv("IDA_DIR"),
@@ -324,21 +324,11 @@ def main():
     if args.mode == "export":
         logger.info("[+] Building global call graph...")
         G = build_global_call_graph(max_funcs=args.max_funcs)
-        # TODO: FIX!! this returns None
-        try:
-            identifier = args.save_path.split("/")[-1]
-        except:
-            identifier = args.save_path
+        identifier = Path(os.getenv("BINARY_PATH")).stem
 
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        output_path = os.path.join(SAVE_PATH, f"gcg_{identifier}_{timestamp}.json")
+        output_path = os.path.join(SAVE_PATH, f"gcg_{identifier}.json")
         export_call_graph_to_json(G, output_path)
         logger.info(f"[+] Exported global graph to {output_path}")
-
-        if args.save_path:
-            logger.info("[+] Generating subgraphs...")
-            process_and_save_subgraphs(G, args.save_path)
-            logger.info(f"[+] Saved {len(os.listdir(args.save_path))} subgraphs")
 
     elif args.mode == "convert":
         if not args.filepath or not args.save_path:
@@ -374,4 +364,5 @@ def main():
 
 
 if __name__ == "__main__":
+
     main()
