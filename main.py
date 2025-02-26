@@ -205,6 +205,14 @@ def process_and_save_subgraphs(G: rx.PyDiGraph, save_path: str) -> None:
     os.makedirs(save_path, exist_ok=True)
     seen_fingerprints = set()
 
+    # Pre-process common_json into a dictionary
+    common_json = orjson.loads(Path("common.json").read_bytes())
+    file2_to_file1 = {}
+    for common in common_json:
+        for file2_func in common["file2_functions"]:
+            if file2_func not in file2_to_file1:  # First occurrence takes precedence
+                file2_to_file1[file2_func] = common["file1_functions"][0]
+
     for subgraph_idx in tqdm(
         G.node_indices(),
         total=G.num_nodes(),
@@ -254,19 +262,18 @@ def process_and_save_subgraphs(G: rx.PyDiGraph, save_path: str) -> None:
             continue
 
         if demangled_name == payload["name"]:
-            try:
-                demangled_name = demangled_name.split("sub_")[1]
-            except:
+            # Optimized lookup with pre-processed dictionary
+            payload_addr = f"sub_{payload['addr']:X}"
+            if payload_addr in file2_to_file1:
+                demangled_name = file2_to_file1[payload_addr]
+            else:
                 continue
         else:
             demangled_name = demangled_name.split("(")[0]
 
         filename = os.path.join(save_path, f"{demangled_name}_subgraph.json")
-        try:
-            with open(filename, "wb") as f:
-                f.write(orjson.dumps(graph_data))
-        except OSError:
-            continue
+        with open(filename, "wb") as f:
+            f.write(orjson.dumps(graph_data))
 
 
 def extract_call_graphlet(G: rx.PyDiGraph, func_idx: int) -> rx.PyDiGraph:

@@ -13,3 +13,4 @@ gcgs
 .DS_STORE
 __pycache*
 string_refs/*
+common.json
