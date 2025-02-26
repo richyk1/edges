@@ -331,7 +331,9 @@ def main():
     if args.mode == "export":
         logger.info("[+] Building global call graph...")
         G = build_global_call_graph(max_funcs=args.max_funcs)
-        identifier = Path(os.getenv("BINARY_PATH")).stem
+        identifier = Path(os.getenv("BINARY_PATH")).stem  # type: ignore
+
+        SAVE_PATH = os.path.join(os.getcwd(), "gcgs")
 
         output_path = os.path.join(SAVE_PATH, f"gcg_{identifier}.json")
         export_call_graph_to_json(G, output_path)
