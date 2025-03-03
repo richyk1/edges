@@ -42,10 +42,10 @@ os.makedirs(SAVE_PATH, exist_ok=True)
 # Utility functions
 # ---------------------------------------------------------------------
 @lru_cache(maxsize=None)
-def demangle_function_name(name: str) -> str:
+def demangle_function_name(name: str) -> None:
     disable_mask = idc.get_inf_attr(idc.INF_SHORT_DN)
     demangled = idc.demangle_name(name, disable_mask)
-    return demangled if demangled is not None else name
+    return demangled
 
 
 def get_callers(func_addr: int) -> Set[int]:
@@ -201,17 +201,24 @@ def import_call_graph_from_json(filepath: str) -> rx.PyDiGraph:
 # ---------------------------------------------------------------------
 # Integrated Conversion Logic
 # ---------------------------------------------------------------------
-def process_and_save_subgraphs(G: rx.PyDiGraph, save_path: str) -> None:
+def process_and_save_subgraphs(
+    G: rx.PyDiGraph, save_path: str, include_stripped: bool
+) -> None:
     os.makedirs(save_path, exist_ok=True)
     seen_fingerprints = set()
 
-    # Pre-process common_json into a dictionary
-    common_json = orjson.loads(Path("common.json").read_bytes())
     file2_to_file1 = {}
-    for common in common_json:
-        for file2_func in common["file2_functions"]:
-            if file2_func not in file2_to_file1:  # First occurrence takes precedence
-                file2_to_file1[file2_func] = common["file1_functions"][0]
+    if "cgn/eu4_win" in save_path:
+        version = save_path.split("_")[-1]
+        common_json = orjson.loads(
+            Path(f"string_refs/eu4_shared_{version}_string_refs.json").read_bytes()
+        )
+        for common in common_json:
+            for file2_func in common["file2_functions"]:
+                if (
+                    file2_func not in file2_to_file1
+                ):  # First occurrence takes precedence
+                    file2_to_file1[file2_func] = common["file1_functions"][0]
 
     for subgraph_idx in tqdm(
         G.node_indices(),
@@ -255,25 +262,39 @@ def process_and_save_subgraphs(G: rx.PyDiGraph, save_path: str) -> None:
         seen_fingerprints.add(fingerprint)
 
         demangled_name = demangle_function_name(payload["name"])
+        if not demangled_name:
+            payload_addr = f"sub_{payload['addr']:X}"
+            if payload_addr in file2_to_file1:
+                demangled_name = file2_to_file1[payload_addr]
+                demangled_name = demangled_name.split("(")[0]
+                # Need to fix the shared funcction generation, sometimes the common function is another stripped subroutine
+                if demangled_name.startswith("sub_"):
+                    continue
+            else:
+                if include_stripped:
+                    # logger.warning(f"[-] Failed to demangle {payload['addr']:X}")
+                    demangled_name = f"{payload['addr']:X}"
+                else:
+                    continue
+        else:
+            demangled_name = demangled_name.split("(")[0]
+
         if any(
             ns in demangled_name
             for ns in ["std::", "boost::", "tbb::", "__acrt", "__crt"]
         ):
             continue
 
-        if demangled_name == payload["name"]:
-            # Optimized lookup with pre-processed dictionary
-            payload_addr = f"sub_{payload['addr']:X}"
-            if payload_addr in file2_to_file1:
-                demangled_name = file2_to_file1[payload_addr]
-            else:
-                continue
-        else:
-            demangled_name = demangled_name.split("(")[0]
+        # check if function is already saved
+        if os.path.exists(os.path.join(save_path, f"{demangled_name}_subgraph.json")):
+            continue
 
-        filename = os.path.join(save_path, f"{demangled_name}_subgraph.json")
-        with open(filename, "wb") as f:
-            f.write(orjson.dumps(graph_data))
+        try:
+            filename = os.path.join(save_path, f"{demangled_name}_subgraph.json")
+            with open(filename, "wb") as f:
+                f.write(orjson.dumps(graph_data))
+        except:
+            continue
 
 
 def extract_call_graphlet(G: rx.PyDiGraph, func_idx: int) -> rx.PyDiGraph:
@@ -325,6 +346,11 @@ def main():
         default=None,
         help="Function address for analysis (import mode)",
     )
+    parser.add_argument(
+        "--include-stripped",
+        action="store_true",
+        help="Include stripped function names in subgraphs",
+    )
 
     args = parser.parse_args()
 
@@ -346,7 +372,8 @@ def main():
 
         logger.info("[+] Converting global graph to subgraphs...")
         G = import_call_graph_from_json(args.filepath)
-        process_and_save_subgraphs(G, args.save_path)
+        logger.info(f"Include stripped is {args.include_stripped}")
+        process_and_save_subgraphs(G, args.save_path, args.include_stripped)
         logger.info(f"[+] Saved {len(os.listdir(args.save_path))} subgraphs")
 
     elif args.mode == "import":

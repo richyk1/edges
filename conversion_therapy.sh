@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Loop through all JSON files in the gcgs directory
-for file in gcgs/*.json; do
+for file in gcgs/*win*.json; do
     # Get the base filename without extension
     base=$(basename "$file" .json)
 

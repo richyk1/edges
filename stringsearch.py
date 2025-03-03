@@ -56,16 +56,18 @@ def collect_string_refs(target_func: int | None) -> DefaultDict[int, List[str]]:
 
     # Iterate through all strings in the binary
     for s in tqdm(idautils.Strings(), desc="Processing strings"):
-        str_ea = s.ea
+        str_ea = s.ea  # type: ignore
         try:
             # Get string content (auto-detects string type)
-            content = idc.get_strlit_contents(str_ea).decode("utf-8", errors="ignore")
+            content = idc.get_strlit_contents(
+                str_ea, strtype=ida_nalt.STRTYPE_TERMCHR
+            ).decode("utf-8", errors="ignore")
         except (UnicodeDecodeError, AttributeError):
             continue
 
         # Process cross-references to this string
         for xref in idautils.XrefsTo(str_ea):
-            xref_ea = xref.frm
+            xref_ea = xref.frm  # type: ignore
             # Skip data references outside code segments
             if not idaapi.is_code(idaapi.get_flags(xref_ea)):
                 continue
