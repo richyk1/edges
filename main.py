@@ -261,23 +261,16 @@ def process_and_save_subgraphs(
             continue
         seen_fingerprints.add(fingerprint)
 
-        demangled_name = demangle_function_name(payload["name"])
+        demangled_name = demangle_function_name(payload["name"]) or file2_to_file1.get(
+            f"sub_{payload['addr']:X}", None
+        )
+
         if not demangled_name:
-            payload_addr = f"sub_{payload['addr']:X}"
-            if payload_addr in file2_to_file1:
-                demangled_name = file2_to_file1[payload_addr]
-                demangled_name = demangled_name.split("(")[0]
-                # Need to fix the shared funcction generation, sometimes the common function is another stripped subroutine
-                if demangled_name.startswith("sub_"):
-                    continue
+            if include_stripped:
+                demangled_name = f"{payload['addr']:X}"
             else:
-                if include_stripped:
-                    # logger.warning(f"[-] Failed to demangle {payload['addr']:X}")
-                    demangled_name = f"{payload['addr']:X}"
-                else:
-                    continue
-        else:
-            demangled_name = demangled_name.split("(")[0]
+                continue
+        demangled_name = demangled_name.split("(")[0]
 
         if any(
             ns in demangled_name

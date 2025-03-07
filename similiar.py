@@ -15,76 +15,52 @@ def load_json_file(file_path: str) -> List[Dict]:
         return orjson.loads(f.read())
 
 
-def filter_bad_strings(strings: List[str]) -> Tuple[List[str], List[str], List[str]]:
-    """
-    Filter out unwanted parts of strings (e.g., Jenkins paths) or normalize them.
-    Returns:
-        - Filtered strings
-        - Unmatched Jenkins paths (strings containing Jenkins paths but not matching regex)
-        - Non-Jenkins strings kept as-is
-    """
-    good_strings = []
-    unmatched_jenkins = []
-    non_jenkins = []
-
-    pattern_unix = re.compile(r"[^\/]+(?:\/[^\/]+)*\/([^\/]+\.(?:h|cpp|c|ipp))(.*)")
-    pattern_win = re.compile(
-        r"[DdCc]:\\(?:[\w\s\.\-]+\\)*([\w\s.\-]+\.(?:c|cpp|h|ipp))(.*)"
-    )
-    pattern_win_mnt = re.compile(r"([C:\\mnt[^\\]+\\)*([^\\]+\.cpp)")
-
-    for s in strings:
-        if "jenkins" in s:
-            match = pattern_unix.search(s)
-            if match:
-                good_strings.append(match.group(1) + match.group(2))
-            else:
-                match = pattern_win.search(s)
-
-                if match:
-                    good_strings.append(match.group(1) + match.group(2))
-                else:
-                    unmatched_jenkins.append(s)
-        else:
-            good_strings.append(s)
-            non_jenkins.append(s)
-
-    return good_strings, unmatched_jenkins, non_jenkins
-
-
 def find_similar_functions(
     file1: List[Dict], file2: List[Dict], threshold: int = 2
 ) -> Dict:
     """
-    Find functions with similar string references between two sets of functions.
-    Assumes that string_refs in file1 and file2 have already been filtered.
+    Find functions with similar string references using an inverted index for efficiency.
     """
-    file1_index = defaultdict(list)
-    file2_index = defaultdict(list)
-
     # Index file1 by the set of strings
+    file1_index = defaultdict(list)
     for func in file1:
         string_set = frozenset(func["string_refs"])
         file1_index[string_set].append(func["name"])
 
     # Index file2 by the set of strings
+    file2_index = defaultdict(list)
     for func in file2:
         string_set = frozenset(func["string_refs"])
         file2_index[string_set].append(func["name"])
 
-    # Compare sets to find matches with at least `threshold` common items
+    # Build inverted index for file2: map each string to sets containing it
+    file2_string_to_sets = defaultdict(set)
+    for s_set in file2_index:
+        for s in s_set:
+            file2_string_to_sets[s].add(s_set)
+
     matches = {}
 
-    file1_items = list(file1_index.items())
-    for set1, names1 in tqdm(file1_items, desc="Comparing sets from file1"):
-        for set2, names2 in file2_index.items():
+    # Compare each set in file1 with relevant sets in file2
+    for set1, names1 in tqdm(file1_index.items(), desc="Processing file1 sets"):
+        # Collect all sets in file2 that share any string with set1
+        candidate_sets = set()
+        for s in set1:
+            candidate_sets.update(file2_string_to_sets.get(s, set()))
+
+        # Check each candidate set in file2
+        for set2 in candidate_sets:
             common = set1 & set2
             if len(common) >= threshold:
-                key = (tuple(names1), tuple(names2))
-                matches[key] = {
-                    "common_strings": list(common),
-                    "count": len(common),
-                }
+                names2 = tuple(file2_index[set2])
+                key = (tuple(names1), names2)
+                # Update matches if this pair has higher or equal count
+                current = matches.get(key, {"count": 0})
+                if len(common) > current["count"]:
+                    matches[key] = {
+                        "common_strings": list(common),
+                        "count": len(common),
+                    }
 
     return matches
 
@@ -108,38 +84,19 @@ def main():
             print(f"Error loading files: {e}")
             continue
 
-        # Pre-process data to collect filtered strings and unmatched info
-        all_unmatched_jenkins = []
-        all_non_jenkins = []
-
         # Process mac_data
         mac_data_filtered = []
         for func in mac_data:
-            filtered, unmatched_j, non_j = filter_bad_strings(func["string_refs"])
-            mac_data_filtered.append({"name": func["name"], "string_refs": filtered})
-            all_unmatched_jenkins.extend(unmatched_j)
-            all_non_jenkins.extend(non_j)
+            mac_data_filtered.append(
+                {"name": func["name"], "string_refs": func["string_refs"]}
+            )
 
         # Process win_data
         win_data_filtered = []
         for func in win_data:
-            filtered, unmatched_j, non_j = filter_bad_strings(func["string_refs"])
-            win_data_filtered.append({"name": func["name"], "string_refs": filtered})
-            all_unmatched_jenkins.extend(unmatched_j)
-            all_non_jenkins.extend(non_j)
-
-        # Save unmatched strings info
-        unmatched_output = {
-            "unmatched_jenkins_paths": all_unmatched_jenkins,
-            "non_jenkins_strings": all_non_jenkins,
-        }
-        base_name = os.path.basename(f)
-        unmatched_file = os.path.join(
-            "unmatched_strings", base_name.replace("_mac_", "_unmatched_")
-        )
-        with open(unmatched_file, "w", encoding="utf-8") as f_out:
-            json.dump(unmatched_output, f_out, indent=2, ensure_ascii=False)
-        print(f"Unmatched strings saved to {unmatched_file}")
+            win_data_filtered.append(
+                {"name": func["name"], "string_refs": func["string_refs"]}
+            )
 
         # Find similar functions with pre-filtered data
         partial_matches = find_similar_functions(

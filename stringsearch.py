@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import os
 from collections import defaultdict
-from typing import DefaultDict, List
+from typing import DefaultDict, List, Union
 
 import orjson
 from dotenv import load_dotenv
@@ -24,6 +24,9 @@ import ida_nalt
 import idautils
 import idc
 import idaapi
+import re
+import orjson
+from typing import Tuple
 
 # Set up logger.
 logger = logging.getLogger(__name__)
@@ -48,6 +51,37 @@ def get_demangled_name(func_addr: int) -> str | None:
     if any(ns in demangled for ns in EXCLUDED_NS):
         return ""
     return demangled
+
+
+def filter_bad_strings(strings: List[str]) -> List[str]:
+    """
+    Filter out unwanted parts of strings (e.g., Jenkins paths) or normalize them.
+    Returns:
+        - Filtered strings
+        - Unmatched Jenkins paths (strings containing Jenkins paths but not matching regex)
+        - Non-Jenkins strings kept as-is
+    """
+    good_strings = []
+
+    pattern_unix = re.compile(r"[^\/]+(?:\/[^\/]+)*\/([^\/]+\.(?:h|cpp|c|ipp))")
+    pattern_win = re.compile(
+        r"[DdCc]:\\(?:[\w\s\.\-]+\\)*([\w\s.\-]+\.(?:cpp|c|h|ipp))"
+    )
+
+    for s in strings:
+        if ".c" in s:
+            match = pattern_unix.search(s)
+            if match:
+                good_strings.append(match.group(1))
+            else:
+                match = pattern_win.search(s)
+
+                if match:
+                    good_strings.append(match.group(1))
+        else:
+            good_strings.append(s)
+
+    return good_strings
 
 
 def collect_string_refs(target_func: int | None) -> DefaultDict[int, List[str]]:
@@ -86,7 +120,64 @@ def collect_string_refs(target_func: int | None) -> DefaultDict[int, List[str]]:
             if content not in string_refs[func_addr]:
                 string_refs[func_addr].append(content)
 
-    return string_refs
+    filtered_refs = defaultdict(list)
+    for func_addr, strings in string_refs.items():
+        filtered_strings, _, _ = filter_bad_strings(strings)
+        filtered_refs[func_addr] = filtered_strings
+
+    return filtered_refs
+
+
+def collect_string_refs_optimized(
+    target_func: Union[int, None] = None
+) -> DefaultDict[int, List[str]]:
+    """Optimized string reference collector with early filtering and efficient storage."""
+    # Use sets for O(1) lookups and automatic deduplication
+    string_refs: DefaultDict[int, set] = defaultdict(set)
+
+    for s in tqdm(idautils.Strings(), desc="Processing strings"):
+        str_ea = s.ea
+
+        # Get string content once per string
+        try:
+            content = idc.get_strlit_contents(str_ea, strtype=ida_nalt.STRTYPE_TERMCHR)
+            if not content:
+                continue
+            decoded_content = content.decode("utf-8", errors="ignore")
+        except (UnicodeDecodeError, AttributeError):
+            continue
+
+        # Pre-filter xrefs and batch process
+        relevant_funcs = set()
+        for xref in idautils.XrefsTo(str_ea):
+            xref_ea = xref.frm
+
+            # Fast code segment check
+            if not idaapi.is_code(idaapi.get_flags(xref_ea)):
+                continue
+
+            # Get containing function once per xref
+            func = idaapi.get_func(xref_ea)
+            if not func:
+                continue
+
+            func_addr = func.start_ea
+
+            # Early target filtering
+            if target_func and func_addr != target_func:
+                continue
+
+            relevant_funcs.add(func_addr)
+
+        # Batch add to all relevant functions
+        for func_addr in relevant_funcs:
+            string_refs[func_addr].add(decoded_content)
+
+    filtered_refs = defaultdict(list)
+    for func_addr, strings in string_refs.items():
+        filtered_refs[func_addr] = filter_bad_strings(strings)
+
+    return filtered_refs
 
 
 def main_check(target_func: int | None, prefix: str) -> None:
@@ -95,7 +186,8 @@ def main_check(target_func: int | None, prefix: str) -> None:
     os.makedirs(save_path, exist_ok=True)
 
     # Step 1: Collect string references using optimized method
-    string_refs = collect_string_refs(target_func)
+    string_refs = collect_string_refs_optimized(target_func)
+    logger.info(f"Collected {len(string_refs)} functions with string references")
 
     # Step 2: Process functions with string references
     all_functions = []
