@@ -294,10 +294,23 @@ def extract_call_graphlet(G: rx.PyDiGraph, func_idx: int) -> rx.PyDiGraph:
     nodes = {func_idx}
     direct_callers = {pred for pred, _, _ in G.in_edges(func_idx)}
     direct_callees = {nbr for _, nbr, _ in G.out_edges(func_idx)}
-    nodes.update(direct_callers)
-    nodes.update(direct_callees)
 
+    # Create a copy of direct_callees to avoid the RuntimeError
+    filtered_direct_callees = direct_callees.copy()
+
+    # function inlining mitigation, if callee ninstrs < 10
+    # if (caller ninstrs / callee ninstrs) < 0.6 <- there's also this but it's too arbitrary
+    # remove it
+    # ref: https://dl.acm.org/doi/pdf/10.1145/3652032.3657572
     for callee in direct_callees:
+        callee_ninstrs = G.get_node_data(callee)["ninstrs"]
+        if callee_ninstrs < 10:
+            filtered_direct_callees.discard(callee)
+
+    nodes.update(direct_callers)
+    nodes.update(filtered_direct_callees)
+
+    for callee in filtered_direct_callees:
         second_level_callees = {nbr for _, nbr, _ in G.out_edges(callee)}
         nodes.update(second_level_callees)
 
